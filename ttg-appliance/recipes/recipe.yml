@@ -1,0 +1,67 @@
+---
+# yaml-language-server: $schema=https://schema.blue-build.org/recipe-v1.json
+# image will be published to ghcr.io/<user>/<name>
+name: ttg-appliance
+# description will be included in the image's metadata
+description: This is my personal OS image.
+
+# the base image to build on top of (FROM) and the version tag to use
+base-image: quay.io/fedora/fedora-coreos
+image-version: stable # latest is also supported if you want new updates ASAP
+
+# module configuration, executed in order
+# you can include multiple instances of the same module
+modules:
+  - type: files
+    files:
+      - source: system
+        destination: / # copies files/system/* (* means everything inside it) into your image's root folder /
+
+  - type: dnf
+    repos:
+      files:
+        - https://pkgs.tailscale.com/stable/fedora/tailscale.repo
+    install:
+      packages:
+        - samba
+        - clevis
+        - clevis-luks
+        - clevis-dracut
+        - clevis-udisks2
+        - clevis-systemd
+        - NetworkManager-tui
+        - fping
+        - btop
+        - btrfsmaintenance
+        - rclone
+        - duperemove
+        - inotify-tools
+        - udisks2
+        - wireshark-cli
+        - tailscale
+        - dos2unix
+        - tayga
+        - radvd
+        - traceroute
+        - python3-dnslib
+        - python3-netifaces
+        - smartmontools
+  - type: systemd
+    system:
+      enabled:
+        - smb.service
+        - watch-share.service
+        - init-share.service
+        - init-tailscale.service
+        - btrfs-scrub.timer
+        - btrfs-trim.timer
+        - tailscaled.service
+        - rpm-ostreed-automatic.timer
+        - podman-auto-update.timer
+        - btrfs-scrub.timer
+        - nat64dns.service
+        - tayga.service
+      disabled:
+        - zincati.service
+
+  - type: signing # this sets up the proper policy & signing files for signed images to work fully
