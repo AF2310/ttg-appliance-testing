@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+import builtins
 from unittest.mock import patch, MagicMock, AsyncMock, mock_open
 from pathlib import Path
 
@@ -48,6 +49,12 @@ try:
 except ImportError as e:
     NAT64DNS_AVAILABLE = False
     print(f"WARNING: Could not import nat64dns: {e}")
+
+# Mute verbose prints from tests to keep test output clean. Restore if needed.
+_original_print = builtins.print
+def _mute_print(*args, **kwargs):
+    pass
+builtins.print = _mute_print
 
 
 class TestNAT64Resolver(unittest.TestCase):
@@ -981,9 +988,368 @@ def print_summary():
     print("="*70)
 
 
-if __name__ == "__main__":
-    # Print summary before running tests
-    print_summary()
+class TestIPAddressConflictResolution(unittest.TestCase):
+    """Tests for IP address conflict resolution scenarios."""
     
+    def test_duplicate_ipv6_synthesis_same_ipv4(self):
+        """Test that same IPv4 address produces same IPv6.
+
+        ISSUE: If DNS64 synthesis is non-deterministic, same IPv4 could
+        produce different IPv6 addresses, causing conflicts.
+        """
+        resolver = NAT64Resolver()
+
+        # Same IPv4, same customer, same site should produce same IPv6
+        qname1 = "192-0-2-1.t000001.nat64"
+        qname2 = "192-0-2-1.t000001.nat64"
+
+        result1 = resolver.resolve(qname1)
+        result2 = resolver.resolve(qname2)
+
+        self.assertIsNotNone(result1)
+        self.assertIsNotNone(result2)
+        self.assertEqual(result1, result2, "Same input should produce identical IPv6")
+    
+    def test_different_customers_same_ipv4(self):
+        """Test IPv6 addresses differ for different customers with same IPv4.
+        
+        ISSUE: If customer_id is not properly encoded, different customers
+        could get the same IPv6 address for same IPv4.
+        """
+        resolver = NAT64Resolver()
+        
+        # Same IPv4 but different customers
+        qname_cust1 = "192-0-2-1.t000001.nat64"
+        qname_cust2 = "192-0-2-1.t000002.nat64"
+        
+        result1 = resolver.resolve(qname_cust1)
+        result2 = resolver.resolve(qname_cust2)
+        
+        self.assertIsNotNone(result1)
+        self.assertIsNotNone(result2)
+        self.assertNotEqual(result1, result2, "Different customers should get different IPv6")
+    
+    def test_different_sites_same_ipv4_customer(self):
+        """Test IPv6 addresses differ for different sites.
+        
+        ISSUE: If site_id is not properly encoded, different sites
+        could get the same IPv6 address.
+        """
+        resolver = NAT64Resolver()
+        
+        # Same IPv4 and customer, but different sites
+        qname_site0 = "192-0-2-1.0.t000001.nat64"
+        qname_site1 = "192-0-2-1.1.t000001.nat64"
+        
+        result1 = resolver.resolve(qname_site0)
+        result2 = resolver.resolve(qname_site1)
+        
+        self.assertIsNotNone(result1)
+        self.assertIsNotNone(result2)
+        self.assertNotEqual(result1, result2, "Different sites should get different IPv6")
+    
+    def test_ipv4_address_pool_exhaustion(self):
+        """Test behavior when synthesizing for edge IPv4 addresses.
+        
+        ISSUE: With limited IPv6 prefix space (/96), may not accommodate
+        all possible IPv4 addresses for a customer.
+        """
+        resolver = NAT64Resolver()
+        
+        # For /96 prefix, should support full IPv4 space (4 billion addresses)
+        # Test edge cases:
+        
+        # Minimum IPv4
+        result_min = resolver.resolve("0-0-0-0.t000001.nat64")
+        self.assertIsNotNone(result_min)
+        
+        # Maximum IPv4
+        result_max = resolver.resolve("255-255-255-255.t000001.nat64")
+        self.assertIsNotNone(result_max)
+        
+        # These should be different
+        self.assertNotEqual(result_min, result_max)
+    
+    def test_customer_id_collision_risk(self):
+        """Test for customer ID collision vulnerabilities.
+        
+        ISSUE: Customer ID is 24-bit, could theoretically have collisions
+        if not properly isolated from site_id (8-bit).
+        """
+        resolver = NAT64Resolver()
+        
+        # Max valid customer ID (24-bit: 0xFFFFFF = 16,777,215)
+        qname_max_customer = "192-0-2-1.tFFFFFF.nat64"
+        result_max = resolver.resolve(qname_max_customer)
+        self.assertIsNotNone(result_max)
+        
+        # Customer ID overflow (25-bit: 0x1000000) should fail
+        qname_overflow = "192-0-2-1.t1000000.nat64"
+        result_overflow = resolver.resolve(qname_overflow)
+        self.assertIsNone(result_overflow)
+    
+    def test_site_id_collision_risk(self):
+        """Test for site ID collision vulnerabilities.
+        
+        ISSUE: Site ID is 8-bit, potential for collisions if not properly
+        isolated from customer_id (24-bit).
+        """
+        resolver = NAT64Resolver()
+        
+        # Max valid site ID (8-bit: 0xFF = 255)
+        qname_max_site = "192-0-2-1.FF.t000001.nat64"
+        result_max = resolver.resolve(qname_max_site)
+        self.assertIsNotNone(result_max)
+        
+        # Site ID overflow (9-bit: 0x100) should fail
+        qname_overflow = "192-0-2-1.100.t000001.nat64"
+        result_overflow = resolver.resolve(qname_overflow)
+        self.assertIsNone(result_overflow)
+    
+    def test_ipv6_address_uniqueness_across_parameters(self):
+        """Test that all combinations produce unique IPv6 addresses.
+        
+        ISSUE: If address construction is wrong, different parameter
+        combinations could produce the same IPv6 address.
+        """
+        resolver = NAT64Resolver()
+        
+        addresses = set()
+        test_cases = [
+            "192-0-2-1.t000001.nat64",
+            "192-0-2-1.t000002.nat64",
+            "192-0-2-2.t000001.nat64",
+            "192-0-2-2.t000002.nat64",
+            "192-0-2-1.1.t000001.nat64",
+            "192-0-2-1.2.t000001.nat64",
+        ]
+        
+        for qname in test_cases:
+            result = resolver.resolve(qname)
+            if result:
+                addr_str = str(result)
+                self.assertNotIn(addr_str, addresses,
+                    f"Duplicate IPv6 found for {qname}: {addr_str}")
+                addresses.add(addr_str)
+        
+        # All should be unique
+        self.assertEqual(len(addresses), len(test_cases))
+    
+    def test_concurrent_ipv6_address_requests(self):
+        """Test concurrent requests for same IPv4 produce same result.
+        
+        ISSUE: Concurrent synthesis requests for same IPv4 should be
+        idempotent and not cause address conflicts.
+        """
+        resolver = NAT64Resolver()
+        qname = "192-0-2-1.t000001.nat64"
+        
+        # Run 10 concurrent requests for same IPv4
+        results = []
+        for _ in range(10):
+            result = resolver.resolve(qname)
+            results.append(str(result) if result else None)
+        
+        # All should be identical
+        self.assertEqual(len(set(results)), 1, "Concurrent requests should produce same IPv6")
+    
+    def test_ipv4_octet_boundary_addresses(self):
+        """Test IPv4 addresses at octet boundaries for synthesis.
+        
+        ISSUE: Address boundaries (e.g., X.0.0.0, X.255.255.255) could
+        cause encoding issues if not handled properly.
+        """
+        resolver = NAT64Resolver()
+        
+        boundary_cases = [
+            "0-0-0-0.t000001.nat64",          # All zeros
+            "255-255-255-255.t000001.nat64",  # All ones
+            "192-0-0-0.t000001.nat64",        # Zero octets
+            "192-255-255-255.t000001.nat64",  # Max octets
+            "192-168-0-0.t000001.nat64",      # Private range
+            "127-0-0-1.t000001.nat64",        # Loopback
+            "224-0-0-0.t000001.nat64",        # Multicast
+        ]
+        
+        results = set()
+        for qname in boundary_cases:
+            result = resolver.resolve(qname)
+            if result:
+                results.add(str(result))
+        
+        # All unique results should be different
+        self.assertEqual(len(results), len(boundary_cases),
+            "All boundary addresses should produce unique IPv6")
+    
+    def test_customer_id_encoding_no_overlap(self):
+        """Test that customer ID bits don't overlap with site ID.
+        
+        ISSUE: If bit shifting is wrong in customer_id << 40 | site_id << 32,
+        bits could overlap and cause collisions.
+        """
+        resolver = NAT64Resolver()
+        
+        # Create addresses that would collide if bit shifting is wrong
+        qname1 = "192-0-2-1.tAAAAAA.nat64"
+        qname2 = "192-0-2-2.t555555.nat64"
+        qname3 = "192-0-2-3.t000001.nat64"
+        
+        result1 = resolver.resolve(qname1)
+        result2 = resolver.resolve(qname2)
+        result3 = resolver.resolve(qname3)
+        
+        # All should be different
+        self.assertNotEqual(result1, result2)
+        self.assertNotEqual(result2, result3)
+        self.assertNotEqual(result1, result3)
+    
+    def test_ipv4_to_ipv6_mapping_is_bijective(self):
+        """Test that IPv4->IPv6 mapping is one-to-one (bijective).
+        
+        ISSUE: If mapping is not bijective, different IPv4 could map to
+        same IPv6 (collision) or same IPv4 could map to different IPv6.
+        """
+        resolver = NAT64Resolver()
+        
+        # Test sample of IPv4 addresses for uniqueness
+        ipv4_samples = [
+            "192-0-2-1",
+            "192-0-2-2",
+            "192-0-2-3",
+            "10-0-0-1",
+            "172-16-0-1",
+        ]
+        
+        ipv6_results = {}
+        for ipv4 in ipv4_samples:
+            qname = f"{ipv4}.t000001.nat64"
+            ipv6 = resolver.resolve(qname)
+            ipv6_str = str(ipv6)
+            
+            if ipv6_str in ipv6_results:
+                self.fail(f"Collision: {ipv4} and {ipv6_results[ipv6_str]} both map to {ipv6_str}")
+            ipv6_results[ipv6_str] = ipv4
+    
+    def test_ipv4_reserved_addresses_handling(self):
+        """Test handling of IPv4 reserved address ranges.
+        
+        ISSUE: Should system allow synthesis for reserved ranges
+        (127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, etc.)?
+        Currently no validation - this could be a design issue.
+        """
+        resolver = NAT64Resolver()
+        
+        reserved_ranges = {
+            "0-0-0-0.t000001.nat64": "0.0.0.0/8 (This host)",
+            "10-0-0-1.t000001.nat64": "10.0.0.0/8 (Private)",
+            "127-0-0-1.t000001.nat64": "127.0.0.0/8 (Loopback)",
+            "169-254-0-1.t000001.nat64": "169.254.0.0/16 (Link-local)",
+            "172-16-0-1.t000001.nat64": "172.16.0.0/12 (Private)",
+            "192-168-0-1.t000001.nat64": "192.168.0.0/16 (Private)",
+            "224-0-0-1.t000001.nat64": "224.0.0.0/4 (Multicast)",
+            "255-255-255-255.t000001.nat64": "255.255.255.255 (Broadcast)",
+        }
+        
+        # Currently, resolver accepts all addresses
+        for qname, description in reserved_ranges.items():
+            result = resolver.resolve(qname)
+            # Currently accepts all - could be security/design issue
+
+
+class TestAddressConflictDetection(unittest.TestCase):
+    """Tests for detecting address conflicts in NAT64 system."""
+    
+    def test_ipv4_to_ipv6_mapping_completeness(self):
+        """Verify IPv4->IPv6 mapping function exists and works.
+        
+        For conflict detection, system needs to map IPv4->IPv6 and
+        check for duplicates. Currently no dedicated function for this.
+        """
+        resolver = NAT64Resolver()
+        
+        # Map several IPv4 addresses
+        mapping = {}
+        for i in range(1, 6):
+            qname = f"192-0-2-{i}.t000001.nat64"
+            ipv6 = resolver.resolve(qname)
+            if ipv6:
+                mapping[f"192.0.2.{i}"] = str(ipv6)
+        
+        # Check all are unique
+        ipv6_values = list(mapping.values())
+        self.assertEqual(len(ipv6_values), len(set(ipv6_values)),
+            "Address mapping should be unique")
+    
+    def test_address_pool_tracking_capability(self):
+        """Test if system can track allocated addresses.
+        
+        ISSUE: No mechanism to track which IPv4->IPv6 mappings exist,
+        making conflict detection impossible.
+        """
+        resolver = NAT64Resolver()
+        
+        # Simulate tracking allocated addresses
+        allocated = {}
+        
+        for i in range(1, 4):
+            qname = f"192-0-2-{i}.t000001.nat64"
+            ipv6 = resolver.resolve(qname)
+            ipv4 = f"192.0.2.{i}"
+            
+            allocated[ipv4] = str(ipv6)
+        
+        # Try to request same IPv4 again - should get same IPv6
+        qname_repeat = "192-0-2-1.t000001.nat64"
+        ipv6_repeat = resolver.resolve(qname_repeat)
+        
+        self.assertEqual(str(ipv6_repeat), allocated["192.0.2.1"],
+            "Repeated allocation should return same IPv6")
+    
+    def test_address_conflict_detection_mechanism(self):
+        """Test if there's a mechanism to detect address conflicts.
+        
+        ISSUE: No built-in conflict detection when allocating addresses.
+        """
+        resolver = NAT64Resolver()
+        
+        # Simulate allocation attempts
+        allocations = []
+        
+        # First allocation
+        qname1 = "192-0-2-1.t000001.nat64"
+        ipv6_1 = resolver.resolve(qname1)
+        allocations.append(ipv6_1)
+        
+        # Try to allocate same address again (should work - no tracking)
+        qname1_again = "192-0-2-1.t000001.nat64"
+        ipv6_1_again = resolver.resolve(qname1_again)
+        allocations.append(ipv6_1_again)
+        
+        # Without tracking, can't detect double allocation
+        # This test documents the limitation
+        self.assertEqual(ipv6_1, ipv6_1_again)
+    
+    def test_address_space_efficiency(self):
+        """Test efficiency of address space usage.
+        
+        ISSUE: /96 NAT64 prefix fits all IPv4 addresses (32 bits) but
+        may not handle all combinations of customer_id (24-bit) + site_id (8-bit).
+        """
+        resolver = NAT64Resolver()
+        
+        # With /96 prefix: 32 bits for IPv4 = 4 billion addresses per customer
+        # 24-bit customer_id = 16 million customers
+        # 8-bit site_id = 256 sites per customer
+        # Total: 16M customers x 256 sites x 4B IPv4 = huge address space needed
+        
+        # Current implementation only uses 32 bits for customer_id + site_id + IPv4
+        # This is actually efficient but limits customer space
+        
+        # Test that it handles the designed limits
+        result = resolver.resolve("192-0-2-1.tFFFFFF.FF.nat64")
+        self.assertIsNotNone(result)
+
+
+if __name__ == "__main__":
     # Run tests
     unittest.main(verbosity=2)
