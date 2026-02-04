@@ -505,8 +505,13 @@ class TestSymlinkFileTypeChanges(unittest.IsolatedAsyncioTestCase):
         
         try:
             # Create symlink chain
-            os.symlink(real_path, symlink2)
-            os.symlink(symlink2, symlink1)
+            try:
+                os.symlink(real_path, symlink2)
+                os.symlink(symlink2, symlink1)
+            except (OSError, NotImplementedError, PermissionError) as e:
+                # On some Windows environments creating symlinks requires special privileges.
+                # Skip this test in that case.
+                self.skipTest(f"symlink not permitted in this environment: {e}")
             
             with patch('nat64dns.NAT64_PREFIX_FILE', symlink1):
                 # First read works

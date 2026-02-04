@@ -4,6 +4,9 @@ import os
 import netifaces
 from typing import Optional
 from dnslib import DNSRecord, DNSHeader, RR, AAAA, QTYPE, RCODE
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
 INTERFACE_NAME = "tailscale0"
@@ -72,19 +75,37 @@ async def query_upstream_async(query_data, upstream_ip, upstream_port):
     future = loop.create_future()
 
     try:
-        # Create a temporary UDP connection for this specific query
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: UpstreamClientProtocol(query_data, future),
-            remote_addr=(upstream_ip, upstream_port),
-        )
+        # Attach a semaphore to the running loop to avoid cross-loop binding issues
+        if not hasattr(loop, '_upstream_semaphore'):
+            loop._upstream_semaphore = asyncio.Semaphore(64)
 
-        # Wait for result with a timeout
+        await loop._upstream_semaphore.acquire()
         try:
-            data = await asyncio.wait_for(future, timeout=2.0)
-            return data
-        except asyncio.TimeoutError:
-            transport.close()
-            return None
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: UpstreamClientProtocol(query_data, future),
+                remote_addr=(upstream_ip, upstream_port),
+            )
+
+            # Wait for result with a timeout
+            try:
+                data = await asyncio.wait_for(future, timeout=2.0)
+                return data
+            except asyncio.TimeoutError:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+                return None
+            finally:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                loop._upstream_semaphore.release()
+            except Exception:
+                pass
     except Exception as e:
         print(f"Async upstream query error: {e}")
         return None
@@ -97,38 +118,81 @@ async def load_nat64_prefix_async():
     """
     loop = asyncio.get_running_loop()
 
+    # Use a small dedicated ThreadPoolExecutor to avoid unbounded thread creation
+    global _FILE_IO_EXECUTOR, _NAT64_CACHE, _NAT64_CACHE_LOCK, _THREAD_FILE_SEMAPHORE
+
     def _read_and_parse():
+        # Bound concurrent file reads using a threading semaphore inside executor
+        acquired = _THREAD_FILE_SEMAPHORE.acquire(timeout=5)
         try:
-            with open(NAT64_PREFIX_FILE, "r") as f:
-                lines = f.readlines()
-            
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                    
-                if line.startswith("prefix"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return parts[1]
+            # Resolve symlinks safely
+            real_path = os.path.realpath(NAT64_PREFIX_FILE)
+            # Basic safety: ensure the prefix file is under /etc or same dir
+            allowed_dir = os.path.realpath(os.path.dirname(NAT64_PREFIX_FILE))
+            if not real_path.startswith(allowed_dir):
+                # suspicious symlink, refuse to follow
+                return None
+
+            # stat may fail in tests where open is patched; allow proceeding
+            try:
+                st = os.stat(real_path)
+                mtime = st.st_mtime
+            except FileNotFoundError:
+                mtime = None
+
+            # Check cache under lock
+            with _NAT64_CACHE_LOCK:
+                cached = _NAT64_CACHE.get('net')
+                cached_mtime = _NAT64_CACHE.get('mtime')
+                cached_path = _NAT64_CACHE.get('path')
+                if cached and cached_path == real_path and cached_mtime == mtime and mtime is not None:
+                    return _NAT64_CACHE.get('raw')
+
+            # Stream file to avoid big memory usage
+            with open(real_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('prefix'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            prefix = parts[1]
+                            # validate quickly before caching
+                            try:
+                                ipaddress.IPv6Network(prefix, strict=False)
+                            except Exception:
+                                return None
+                            # update cache
+                            with _NAT64_CACHE_LOCK:
+                                _NAT64_CACHE['net'] = ipaddress.IPv6Network(prefix, strict=False)
+                                _NAT64_CACHE['raw'] = prefix
+                                _NAT64_CACHE['mtime'] = mtime
+                                _NAT64_CACHE['path'] = real_path
+                            return prefix
+
             return None
-            
         except FileNotFoundError:
-            # File doesn't exist, just return None
             return None
         except Exception as e:
             print(f"Error reading {NAT64_PREFIX_FILE}: {e}")
             return None
+        finally:
+            try:
+                if acquired:
+                    _THREAD_FILE_SEMAPHORE.release()
+            except Exception:
+                pass
 
-    # Run the file IO and string parsing in the thread
-    ipv6_prefix_str = await loop.run_in_executor(None, _read_and_parse)
+    ipv6_prefix_str = await loop.run_in_executor(_FILE_IO_EXECUTOR, _read_and_parse)
 
     if not ipv6_prefix_str:
         return None
 
     try:
-        # Validate the IP object back in the main thread
-        return ipaddress.IPv6Network(ipv6_prefix_str, strict=False)
+        # Validate and return IPv6Network
+        net = ipaddress.IPv6Network(ipv6_prefix_str, strict=False)
+        return net
     except ValueError:
         print(f"Invalid IPv6 prefix format: {ipv6_prefix_str}")
         return None
@@ -151,13 +215,27 @@ class NAT64Resolver:
             return None
 
         ipv4_part_str = parts[0]
+        # Flexible parsing: accept either 'ipv4.site.tcustomer' or 'ipv4.tcustomer.site'
         customer_id_str = parts[-1]
         site_id_str = "0"
 
         if len(parts) == 3:
-            site_id_str = parts[1]
+            # detect which of the two middle/last parts carries the 't' prefix
+            part1 = parts[1]
+            part2 = parts[2]
+            if part1.startswith('t'):
+                customer_id_str = part1[1:]
+                site_id_str = part2
+            elif part2.startswith('t'):
+                customer_id_str = part2[1:]
+                site_id_str = part1
+            else:
+                # fallback to previous behavior: treat last part as customer, middle as site
+                customer_id_str = parts[-1]
+                site_id_str = parts[1]
 
-        if customer_id_str.startswith("t"):
+        # allow an optional leading 't' on customer id when present
+        if customer_id_str.startswith('t'):
             customer_id_str = customer_id_str[1:]
 
         try:
@@ -209,10 +287,18 @@ async def resolve_upstream_dns64(qname, nat64_net):
         synthesized_ips = []
         prefix_int = int(nat64_net.network_address)
 
+        # Determine how many host bits are available in the prefix
+        host_bits = 128 - nat64_net.prefixlen
+        if host_bits < 32:
+            # Cannot represent a full IPv4 address in this prefix
+            print(f"NAT64 prefix {nat64_net} too small to embed IPv4 (host_bits={host_bits})")
+            return []
+
         for rr in upstream_reply.rr:
             if rr.rtype == QTYPE.A:
                 ipv4_addr = ipaddress.IPv4Address(str(rr.rdata))
-                ipv4_int = int(ipv4_addr)
+                ipv4_int = int(ipv4_addr) & 0xFFFFFFFF
+                # IPv4 is placed in the low 32 bits; this works for /96 and any prefix with >=32 host bits
                 synth_int = prefix_int | ipv4_int
                 synthesized_ips.append(ipaddress.IPv6Address(synth_int))
 
@@ -221,6 +307,16 @@ async def resolve_upstream_dns64(qname, nat64_net):
     except Exception as e:
         print(f"Upstream resolution failed for {qname}: {e}")
         return []
+
+
+# --- Module-level helpers and limits ---
+# Thread pool for bounded file IO operations
+_FILE_IO_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+# Cache for NAT64 prefix: {'net': IPv6Network, 'raw': str, 'mtime': float, 'path': str}
+_NAT64_CACHE = {'net': None, 'raw': None, 'mtime': None, 'path': None}
+_NAT64_CACHE_LOCK = threading.Lock()
+# Threading semaphore to limit concurrent executor file reads (safe across event loops)
+_THREAD_FILE_SEMAPHORE = threading.Semaphore(8)
 
 
 class DNSServerProtocol(asyncio.DatagramProtocol):
